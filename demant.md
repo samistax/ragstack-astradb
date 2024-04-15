@@ -27,6 +27,6 @@ Some applicable use cases for sidekick listed below
   Assist the customer in how to use the fitting software if they are in doubt
   
 - ##### Fitting Suggestions 
-  Possible stretch, but could be used to guide customers in some markets on hearing aid setup for the individual clients
+  Could be used to Guide customers in some markets on hearing aid setup for the individual clients
 
 ---
