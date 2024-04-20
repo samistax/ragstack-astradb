@@ -7,28 +7,31 @@ import uuid
 import boto3
 
 import streamlit as st
-
-from langchain.vectorstores import AstraDB
-from langchain.embeddings import OpenAIEmbeddings
-from langchain_community.embeddings import BedrockEmbeddings
+from langchain.chains.conversational_retrieval.base import ConversationalRetrievalChain
 
 from langchain.memory import ConversationBufferWindowMemory
 from langchain.memory import AstraDBChatMessageHistory
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain.document_loaders import PyPDFLoader, CSVLoader
-from langchain.schema import HumanMessage, AIMessage
 from langchain.prompts import ChatPromptTemplate
+from langchain.callbacks.base import BaseCallbackHandler
+from langchain.schema import HumanMessage, AIMessage
 from langchain.schema.runnable import RunnableMap
 from langchain.schema import StrOutputParser
 
+from langchain_astradb import AstraDBChatMessageHistory
+from langchain_astradb import AstraDBVectorStore
+
+from langchain_community.document_loaders import PyPDFLoader, CSVLoader,WebBaseLoader
+from langchain_community.embeddings import OpenAIEmbeddings
+from langchain_community.embeddings import BedrockEmbeddings
 from langchain_community.chat_models.ollama import ChatOllama
 from langchain_community.chat_models.openai import ChatOpenAI
 from langchain_community.chat_models.bedrock import BedrockChat
+from langchain_community.llms.bedrock import Bedrock
+from langchain_core.prompts import PromptTemplate
+from langchain_core.runnables import RunnablePassthrough
 
-from langchain.callbacks.base import BaseCallbackHandler
-from langchain.document_loaders import WebBaseLoader
-
-import openai
+#from langchain_community.llms.bedrock import Bedrock
 
 print("Started")
 st.set_page_config(page_title='Your Enterprise Sidekick', page_icon='🚀')
@@ -65,9 +68,6 @@ global disable_vector_store
 global strategy
 global prompt_type
 global custom_prompt
-
-#AWS Bedrock
-global bedrock_runtime
 
 #################
 ### Functions ###
@@ -253,15 +253,25 @@ def load_model(chain_type):
 # Get the Bedrock LLM
 def load_model_bedrock():
 
+    bedrock_runtime = boto3.client(
+        service_name='bedrock-runtime',
+        region_name='us-west-2',
+    )
+    return Bedrock(
+
+        credentials_profile_name=st.secrets["AWS_PROFILE"],
+        client=bedrock_runtime,
+        model_id="amazon.titan-text-express-v1",
+        model_kwargs={'temperature': 0.5},
+        streaming=True)
+
+def load_model_bedrock_alt():
     return BedrockChat(
-        credentials_profile_name="111708290731_FIELDOPS_FOPS-PRE",
-        endpoint_url="https://bedrock-runtime.us-west-2.amazonaws.com",
-        region_name = "us-west-2",
+        credentials_profile_name=st.secrets["AWS_PROFILE"],
         model_id="amazon.titan-text-express-v1",
         model_kwargs={"temperature": 0.2},
         streaming=True,
         verbose=True,
-        #callbacks=[BedrockCallbackHandler(response_placeholder)],
         #callbacks=[StreamingStdOutCallbackHandler()],
     )
 
@@ -392,28 +402,21 @@ def load_embedding():
 @st.cache_resource(show_spinner=lang_dict['load_embedding_bedrock'])
 def load_embedding_bedrock():
     print("load_embedding_bedrock")
+
     bedrock_runtime = boto3.client(
         service_name='bedrock-runtime',
         region_name='us-west-2',
     )
-    #embeddings = BedrockEmbeddings(model_id="amazon.titan-embed-text-v1", client=bedrock_runtime, )
 
-    client = boto3.client(
-        service_name="bedrock-runtime",
-        region_name="us-west-2",
-        aws_access_key_id=st.secrets["AWS_ACCESS_KEY"],
-        aws_secret_access_key=st.secrets["AWS_SECRET_KEY"],
-        aws_session_token=st.secrets["AWS_SESSION_TOKEN"]
-    )
     # Get the Bedrock Embedding
-    return BedrockEmbeddings(model_id="amazon.titan-embed-text-v1", client=client)
+    return BedrockEmbeddings(model_id="amazon.titan-embed-text-v1", client=bedrock_runtime)
 
 # Cache Vector Store for future runs
 @st.cache_resource(show_spinner=lang_dict['load_vectorstore'])
 def load_vectorstore(username):
     print("load_vectorstore")
     # Get the load_vectorstore store from Astra DB
-    return AstraDB(
+    return AstraDBVectorStore(
         embedding=embedding,
         collection_name=f"vector_context_{username}",
         token=st.secrets["ASTRA_TOKEN"],
@@ -612,22 +615,52 @@ if question:
 
         # Create the chain
         inputs = RunnableMap({
-            'context': lambda x: x['context'],
+            'context': lambda x: retriever.get_relevant_documents(x['question']),
             'chat_history': lambda x: x['chat_history'],
             'question': lambda x: x['question']
         })
         print(f"Using inputs: {inputs}")
 
-        chain = inputs | get_prompt(prompt_type) | model
+        system_prompt = get_prompt(prompt_type)
+        print(f"Using prompt: {system_prompt}")
+        # Generate the answer by calling OpenAI's Chat Model
+
+        chain = inputs | system_prompt | model | StrOutputParser()
         print(f"Using chain: {chain}")
 
-
         # Call the chain and stream the results into the UI
-        response = chain.invoke({'question': question, 'chat_history': history, 'context': relevant_documents}, config={'callbacks': [StreamHandler(response_placeholder)]})
-        #stream_iterator = model.stream(st.session_state.messages)
+        #response = chain.invoke({'question': question, 'chat_history': history, 'context': relevant_documents},config={'callbacks': [StreamHandler(response_placeholder)]})
+        #print(f"Response: {response}")
 
-        print(f"Response: {response}")
-        content += response.content
+        conversation_chain = ConversationalRetrievalChain.from_llm(
+            llm=model,
+            retriever=retriever,
+            memory=memory,
+            verbose=True,
+            condense_question_prompt=system_prompt,
+            #combine_docs_chain_kwargs={}
+            max_tokens_limit=1024,
+        )
+        # results = conversation_chain({"question": question})
+        # print(results["answer"])
+
+        # Chain Stream
+        #
+        response = ""
+        for tokens in conversation_chain.stream(
+                {'question': question, 'chat_history': history,'context': retriever.get_relevant_documents(question)},
+                config={'callbacks': [StreamHandler(response_placeholder)]}):
+            response += tokens["answer"]
+            # write response with "▌" to indicate streaming.
+            with response_placeholder:
+                st.markdown(response + "▌")
+
+        # write response without "▌" to indicate completed message.
+        with response_placeholder:
+            st.markdown(response)
+
+        #content += response.content
+        content += response
 
         # Add the result to memory (without the sources)
         memory.save_context({'question': question}, {'answer': content})

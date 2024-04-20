@@ -3,8 +3,10 @@ streamlit
 ragstack-ai
 langchainhub
 langchain-community
+langchain-astradb
 openai
 tiktoken
 pypdf
 pandas
 boto3
+transformers
