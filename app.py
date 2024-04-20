@@ -4,12 +4,14 @@ import hmac
 import tempfile
 import pandas as pd
 import uuid
+import boto3
 
 import streamlit as st
 
-from langchain.chat_models import ChatOpenAI
 from langchain.vectorstores import AstraDB
 from langchain.embeddings import OpenAIEmbeddings
+from langchain_community.embeddings import BedrockEmbeddings
+
 from langchain.memory import ConversationBufferWindowMemory
 from langchain.memory import AstraDBChatMessageHistory
 from langchain.text_splitter import RecursiveCharacterTextSplitter
@@ -19,8 +21,11 @@ from langchain.prompts import ChatPromptTemplate
 from langchain.schema.runnable import RunnableMap
 from langchain.schema import StrOutputParser
 
-from langchain.callbacks.base import BaseCallbackHandler
+from langchain_community.chat_models.ollama import ChatOllama
+from langchain_community.chat_models.openai import ChatOpenAI
+from langchain_community.chat_models.bedrock import BedrockChat
 
+from langchain.callbacks.base import BaseCallbackHandler
 from langchain.document_loaders import WebBaseLoader
 
 import openai
@@ -60,6 +65,9 @@ global disable_vector_store
 global strategy
 global prompt_type
 global custom_prompt
+
+#AWS Bedrock
+global bedrock_runtime
 
 #################
 ### Functions ###
@@ -195,7 +203,6 @@ Answer in {language}:"""
         print ("Prompt type: Short results")
         template = f"""You're a helpful AI assistant tasked to answer the user's questions.
 You answer in an exceptionally brief way.
-If the question states the name of the user, just say 'Thanks, I'll use this information going forward'.
 If you don't know the answer, just say 'I do not know the answer'.
 
 Use the following context to answer the question:
@@ -215,6 +222,15 @@ Answer in {language}:"""
 
     return ChatPromptTemplate.from_messages([("system", template)])
 
+
+# Get the Mistral LLM Model
+def load_model_mistral():
+    # Get the Mistal Model, self hosted in AWS
+    #return ChatOllama(model="mistral:latest", num_ctx=18192, base_url="http://3.253.55.214:11434")
+    # Get the Mistal Model, hosted on localhost
+    return ChatOllama(model="mistral:latest", num_ctx=18192)
+
+
 # Get the OpenAI Chat Model
 def load_model(chain_type):
     if chain_type == 'Stuff':
@@ -224,6 +240,7 @@ def load_model(chain_type):
     if chain_type == 'Map Reduce':
         chain_type = 'map_reduce'
     print(f"""load_model using {chain_type}""")
+
     # Get the OpenAI Chat Model
     return ChatOpenAI(
         temperature=0.3,
@@ -231,6 +248,23 @@ def load_model(chain_type):
         streaming=True,
         verbose=True
     )
+
+
+# Get the Bedrock LLM
+def load_model_bedrock():
+
+    return BedrockChat(
+        credentials_profile_name="111708290731_FIELDOPS_FOPS-PRE",
+        endpoint_url="https://bedrock-runtime.us-west-2.amazonaws.com",
+        region_name = "us-west-2",
+        model_id="amazon.titan-text-express-v1",
+        model_kwargs={"temperature": 0.2},
+        streaming=True,
+        verbose=True,
+        #callbacks=[BedrockCallbackHandler(response_placeholder)],
+        #callbacks=[StreamingStdOutCallbackHandler()],
+    )
+
 
 # Get the Retriever
 def load_retriever(top_k_vectorstore):
@@ -350,8 +384,29 @@ lang_dict = load_localization(language)
 @st.cache_resource(show_spinner=lang_dict['load_embedding'])
 def load_embedding():
     print("load_embedding")
+
     # Get the OpenAI Embedding
     return OpenAIEmbeddings()
+
+# Cache Bedrock Embedding for future runs
+@st.cache_resource(show_spinner=lang_dict['load_embedding_bedrock'])
+def load_embedding_bedrock():
+    print("load_embedding_bedrock")
+    bedrock_runtime = boto3.client(
+        service_name='bedrock-runtime',
+        region_name='us-west-2',
+    )
+    #embeddings = BedrockEmbeddings(model_id="amazon.titan-embed-text-v1", client=bedrock_runtime, )
+
+    client = boto3.client(
+        service_name="bedrock-runtime",
+        region_name="us-west-2",
+        aws_access_key_id=st.secrets["AWS_ACCESS_KEY"],
+        aws_secret_access_key=st.secrets["AWS_SECRET_KEY"],
+        aws_session_token=st.secrets["AWS_SESSION_TOKEN"]
+    )
+    # Get the Bedrock Embedding
+    return BedrockEmbeddings(model_id="amazon.titan-embed-text-v1", client=client)
 
 # Cache Vector Store for future runs
 @st.cache_resource(show_spinner=lang_dict['load_vectorstore'])
@@ -411,7 +466,8 @@ with st.sidebar:
 # Initialize
 with st.sidebar:
     rails_dict = load_rails(username)
-    embedding = load_embedding()
+    embedding = load_embedding_bedrock()
+    #embedding = load_embedding()
     vectorstore = load_vectorstore(username)
     chat_history = load_chat_history(username)
 
@@ -503,7 +559,9 @@ if question:
         st.markdown(question)
 
     # Get model, retriever
-    model = load_model(chain_type)
+    #model = load_model(chain_type)
+    #model = load_model_mistral()
+    model = load_model_bedrock()
     retriever = load_retriever(top_k_vectorstore)
 
     # RAG Strategy
@@ -563,8 +621,11 @@ if question:
         chain = inputs | get_prompt(prompt_type) | model
         print(f"Using chain: {chain}")
 
+
         # Call the chain and stream the results into the UI
         response = chain.invoke({'question': question, 'chat_history': history, 'context': relevant_documents}, config={'callbacks': [StreamHandler(response_placeholder)]})
+        #stream_iterator = model.stream(st.session_state.messages)
+
         print(f"Response: {response}")
         content += response.content
 

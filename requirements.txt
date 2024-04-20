@@ -2,7 +2,9 @@
 streamlit
 ragstack-ai
 langchainhub
+langchain-community
 openai
 tiktoken
 pypdf
 pandas
+boto3
