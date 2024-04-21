@@ -5,6 +5,7 @@ import tempfile
 import pandas as pd
 import uuid
 import boto3
+import openai
 
 import streamlit as st
 from langchain.chains.conversational_retrieval.base import ConversationalRetrievalChain
@@ -28,10 +29,6 @@ from langchain_community.chat_models.ollama import ChatOllama
 from langchain_community.chat_models.openai import ChatOpenAI
 from langchain_community.chat_models.bedrock import BedrockChat
 from langchain_community.llms.bedrock import Bedrock
-from langchain_core.prompts import PromptTemplate
-from langchain_core.runnables import RunnablePassthrough
-
-#from langchain_community.llms.bedrock import Bedrock
 
 print("Started")
 st.set_page_config(page_title='Your Enterprise Sidekick', page_icon='🚀')
@@ -232,15 +229,16 @@ def load_model_mistral():
 
 
 # Get the OpenAI Chat Model
-def load_model(chain_type):
-    if chain_type == 'Stuff':
-        chain_type = 'stuff'
-    if chain_type == 'Refine':
-        chain_type = 'refine'
-    if chain_type == 'Map Reduce':
-        chain_type = 'map_reduce'
-    print(f"""load_model using {chain_type}""")
+def load_model(model_name):
+    if model_name == 'mistral':
+        return load_model_mistral()
+    elif model_name == 'bedrock':
+        return load_model_bedrock()
+    elif chain_type == 'openai':
+        return load_model_openai()
+    return load_model_openai()
 
+def load_model_openai():
     # Get the OpenAI Chat Model
     return ChatOpenAI(
         temperature=0.3,
@@ -256,10 +254,12 @@ def load_model_bedrock():
     bedrock_runtime = boto3.client(
         service_name='bedrock-runtime',
         region_name='us-west-2',
+        aws_access_key_id=st.secrets["AWS_ACCESS_KEY"],
+        aws_secret_access_key=st.secrets["AWS_SECRET_KEY"],
+        aws_session_token=st.secrets["AWS_SESSION_TOKEN"]
     )
     return Bedrock(
 
-        credentials_profile_name=st.secrets["AWS_PROFILE"],
         client=bedrock_runtime,
         model_id="amazon.titan-text-express-v1",
         model_kwargs={'temperature': 0.5},
@@ -267,7 +267,10 @@ def load_model_bedrock():
 
 def load_model_bedrock_alt():
     return BedrockChat(
-        credentials_profile_name=st.secrets["AWS_PROFILE"],
+        #credentials_profile_name=st.secrets["AWS_PROFILE"],
+        aws_access_key_id=st.secrets["AWS_ACCESS_KEY"],
+        aws_secret_access_key=st.secrets["AWS_SECRET_KEY"],
+        aws_session_token=st.secrets["AWS_SESSION_TOKEN"],
         model_id="amazon.titan-text-express-v1",
         model_kwargs={"temperature": 0.2},
         streaming=True,
@@ -385,14 +388,24 @@ if not check_password():
 username = st.session_state.user
 language = st.secrets.languages[username]
 lang_dict = load_localization(language)
+model_name = st.secrets["LLM_MODEL"]
 
 #######################
 ### Resources Cache ###
 #######################
 
+
+def load_embedding(embedding_name):
+    print("load_embedding")
+    if embedding_name == 'bedrock':
+        return load_embedding_bedrock()
+    else:
+        return load_embedding_openai()
+
+
 # Cache OpenAI Embedding for future runs
 @st.cache_resource(show_spinner=lang_dict['load_embedding'])
-def load_embedding():
+def load_embedding_openai():
     print("load_embedding")
 
     # Get the OpenAI Embedding
@@ -402,10 +415,12 @@ def load_embedding():
 @st.cache_resource(show_spinner=lang_dict['load_embedding_bedrock'])
 def load_embedding_bedrock():
     print("load_embedding_bedrock")
-
     bedrock_runtime = boto3.client(
         service_name='bedrock-runtime',
         region_name='us-west-2',
+        aws_access_key_id=st.secrets["AWS_ACCESS_KEY"],
+        aws_secret_access_key=st.secrets["AWS_SECRET_KEY"],
+        aws_session_token=st.secrets["AWS_SESSION_TOKEN"]
     )
 
     # Get the Bedrock Embedding
@@ -413,16 +428,15 @@ def load_embedding_bedrock():
 
 # Cache Vector Store for future runs
 @st.cache_resource(show_spinner=lang_dict['load_vectorstore'])
-def load_vectorstore(username):
+def load_vectorstore(username, model):
     print("load_vectorstore")
     # Get the load_vectorstore store from Astra DB
     return AstraDBVectorStore(
         embedding=embedding,
-        collection_name=f"vector_context_{username}",
+        collection_name=f"vector_context_{username}_{model}",
         token=st.secrets["ASTRA_TOKEN"],
         api_endpoint=os.environ["ASTRA_ENDPOINT"],
     )
-
 # Cache Chat History for future runs
 @st.cache_resource(show_spinner=lang_dict['load_message_history'])
 def load_chat_history(username):
@@ -469,9 +483,8 @@ with st.sidebar:
 # Initialize
 with st.sidebar:
     rails_dict = load_rails(username)
-    embedding = load_embedding_bedrock()
-    #embedding = load_embedding()
-    vectorstore = load_vectorstore(username)
+    embedding = load_embedding(model_name)
+    vectorstore = load_vectorstore(username, model_name)
     chat_history = load_chat_history(username)
 
 # Options panel
@@ -562,9 +575,7 @@ if question:
         st.markdown(question)
 
     # Get model, retriever
-    #model = load_model(chain_type)
-    #model = load_model_mistral()
-    model = load_model_bedrock()
+    model = load_model(model_name)
     retriever = load_retriever(top_k_vectorstore)
 
     # RAG Strategy
@@ -621,46 +632,48 @@ if question:
         })
         print(f"Using inputs: {inputs}")
 
-        system_prompt = get_prompt(prompt_type)
-        print(f"Using prompt: {system_prompt}")
+        custom_prompt = get_prompt(prompt_type)
+        print(f"Using prompt: {custom_prompt}")
         # Generate the answer by calling OpenAI's Chat Model
 
-        chain = inputs | system_prompt | model | StrOutputParser()
+        chain = inputs | custom_prompt | model | StrOutputParser()
         print(f"Using chain: {chain}")
-
+        #
+        mode = True
         # Call the chain and stream the results into the UI
-        #response = chain.invoke({'question': question, 'chat_history': history, 'context': relevant_documents},config={'callbacks': [StreamHandler(response_placeholder)]})
-        #print(f"Response: {response}")
+        if model_name != 'bedrock':
+            response = chain.invoke({'question': question, 'chat_history': history, 'context': relevant_documents},config={'callbacks': [StreamHandler(response_placeholder)]})
+            print(f"Response: {response}")
+            content += response
 
-        conversation_chain = ConversationalRetrievalChain.from_llm(
-            llm=model,
-            retriever=retriever,
-            memory=memory,
-            verbose=True,
-            condense_question_prompt=system_prompt,
-            #combine_docs_chain_kwargs={}
-            max_tokens_limit=1024,
-        )
+        else:
+            conversation_chain = ConversationalRetrievalChain.from_llm(
+                llm=model,
+                retriever=retriever,
+                memory=memory,
+                verbose=True,
+                condense_question_prompt=custom_prompt,
+                max_tokens_limit=1024,
+            )
         # results = conversation_chain({"question": question})
         # print(results["answer"])
 
         # Chain Stream
         #
-        response = ""
-        for tokens in conversation_chain.stream(
-                {'question': question, 'chat_history': history,'context': retriever.get_relevant_documents(question)},
-                config={'callbacks': [StreamHandler(response_placeholder)]}):
-            response += tokens["answer"]
-            # write response with "▌" to indicate streaming.
+            response = ""
+            for tokens in conversation_chain.stream(
+                    {'question': question, 'chat_history': history,'context': retriever.get_relevant_documents(question)},
+                    config={'callbacks': [StreamHandler(response_placeholder)]}):
+                response += tokens["answer"]
+                # write response with "▌" to indicate streaming.
+                with response_placeholder:
+                    st.markdown(response + "▌")
+
+            # write response without "▌" to indicate completed message.
             with response_placeholder:
-                st.markdown(response + "▌")
+                st.markdown(response)
 
-        # write response without "▌" to indicate completed message.
-        with response_placeholder:
-            st.markdown(response)
-
-        #content += response.content
-        content += response
+            content += response
 
         # Add the result to memory (without the sources)
         memory.save_context({'question': question}, {'answer': content})
